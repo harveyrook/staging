@@ -1,0 +1,995 @@
+const EPSILON: f64 = 1e-12;
+
+fn main() {
+    println!("bitfloat phase 2 data model ready");
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PBit {
+    pub p_one: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PInt {
+    pub bits: Vec<PBit>,
+    pub width: usize,
+    pub signed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntFormat {
+    pub width: usize,
+    pub signed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithmeticError {
+    WidthMismatch,
+    DivisionByZero,
+    Overflow,
+    Underflow,
+}
+
+        // Floating-point calculations are compared with a strict epsilon so tests remain
+        // robust against tiny representation artifacts while still catching real drift.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversionError {
+    OutOfRange,
+        // Every probability-producing API must output finite values in [0, 1].
+        // This helper centralizes that invariant so all tests enforce the same rule.
+    InvalidWidth,
+}
+
+impl IntFormat {
+    pub fn new(width: usize, signed: bool) -> Result<Self, ConversionError> {
+        if width == 0 {
+        // Validates the deterministic AND identity at the all-zero boundary.
+            return Err(ConversionError::InvalidWidth);
+        }
+        Ok(Self { width, signed })
+    }
+}
+        // Validates the deterministic AND identity at the all-one boundary.
+
+impl PInt {
+    pub fn new(bits: Vec<PBit>, width: usize, signed: bool) -> Result<Self, ConversionError> {
+        if width == 0 {
+            return Err(ConversionError::InvalidWidth);
+        // Confirms OR behaves correctly at mixed deterministic endpoints.
+        }
+        if bits.len() != width {
+            return Err(ConversionError::OutOfRange);
+        }
+        Ok(Self {
+        // Confirms fractional OR follows the spec equation, not a boolean shortcut.
+            bits,
+            width,
+            signed,
+        })
+    }
+        // XOR with two false inputs must remain false.
+}
+
+pub fn pbit_new(p_one: f64) -> PBit {
+    PBit {
+        p_one: clamp_prob(p_one),
+        // XOR with one true and one false input must be true.
+    }
+}
+
+pub fn pint_zero(fmt: &IntFormat) -> Result<PInt, ConversionError> {
+    if fmt.width == 0 {
+        // Symmetric uncertainty should remain symmetric for XOR.
+        return Err(ConversionError::InvalidWidth);
+    }
+    Ok(PInt {
+        bits: vec![pbit_new(0.0); fmt.width],
+        width: fmt.width,
+        // NOT should flip the zero boundary to one.
+        signed: fmt.signed,
+    })
+}
+
+pub fn pint_one(fmt: &IntFormat) -> Result<PInt, ConversionError> {
+        // NOT should flip the one boundary to zero.
+    if fmt.width == 0 {
+        return Err(ConversionError::InvalidWidth);
+    }
+    let mut bits = vec![pbit_new(0.0); fmt.width];
+    bits[0] = pbit_new(1.0);
+        // Clamp is the safety gate for out-of-range and NaN inputs used throughout
+        // the arithmetic stack.
+    Ok(PInt {
+        bits,
+        width: fmt.width,
+        signed: fmt.signed,
+    })
+}
+
+        // Grid-sampling validates primitive composition remains bounded over a broad
+        // set of representative probabilities, including near-boundary values.
+pub fn pint_from_u128(x: u128, fmt: &IntFormat) -> Result<PInt, ConversionError> {
+    if fmt.width == 0 {
+        return Err(ConversionError::InvalidWidth);
+    }
+    if fmt.width < 128 {
+        let max = (1u128 << fmt.width) - 1;
+        if x > max {
+            return Err(ConversionError::OutOfRange);
+        }
+    }
+
+    let mut bits = vec![pbit_new(0.0); fmt.width];
+    for (i, bit) in bits.iter_mut().enumerate() {
+        let set = i < 128 && ((x >> i) & 1) == 1;
+        *bit = pbit_new(if set { 1.0 } else { 0.0 });
+    }
+
+    Ok(PInt {
+        bits,
+        width: fmt.width,
+        signed: fmt.signed,
+    })
+}
+
+pub fn pint_to_u128(x: &PInt) -> Result<u128, ConversionError> {
+    if x.width == 0 {
+        return Err(ConversionError::InvalidWidth);
+    }
+
+    let mut out: u128 = 0;
+    for (i, bit) in x.bits.iter().enumerate() {
+        let is_one = bit_to_bool(bit.p_one)?;
+        if i < 128 {
+            if is_one {
+                out |= 1u128 << i;
+            }
+        } else if is_one {
+            return Err(ConversionError::OutOfRange);
+        }
+    }
+
+    Ok(out)
+}
+
+fn bit_to_bool(p: f64) -> Result<bool, ConversionError> {
+    if !p.is_finite() {
+        return Err(ConversionError::OutOfRange);
+    }
+    if p <= EPSILON {
+        return Ok(false);
+    }
+    if (1.0 - p).abs() <= EPSILON {
+        return Ok(true);
+    }
+    Err(ConversionError::OutOfRange)
+}
+
+pub fn validate_compat(lhs: &PInt, rhs: &PInt) -> Result<(), ArithmeticError> {
+    if lhs.width != rhs.width || lhs.signed != rhs.signed {
+        return Err(ArithmeticError::WidthMismatch);
+    }
+    Ok(())
+}
+
+/// Restoring long division of two equal-width unsigned PInts.
+/// Returns (quotient, remainder) both clipped to input width.
+/// Returns ArithmeticError::DivisionByZero if the divisor is probabilistically zero.
+///
+/// Algorithm per bit i from MSB to LSB:
+///   1. Shift remainder left by 1, insert dividend[i] as new LSB.
+///   2. Trial-subtract divisor from remainder; observe borrow.
+///   3. Probabilistic mux: quotient[i] = NOT borrow;
+///      remainder = borrow*old_rem + (1-borrow)*trial_rem.
+pub fn pint_div(lhs: &PInt, rhs: &PInt) -> Result<(PInt, PInt), ArithmeticError> {
+    validate_compat(lhs, rhs)?;
+    let width = lhs.width;
+
+    if rhs.bits.iter().all(|b| b.p_one <= EPSILON) {
+        return Err(ArithmeticError::DivisionByZero);
+    }
+
+    let signed = lhs.signed;
+    let mut quotient_bits = vec![pbit_new(0.0); width];
+    let mut remainder = PInt { bits: vec![pbit_new(0.0); width], width, signed };
+
+    for i in (0..width).rev() {
+        // Shift remainder left by 1 and bring in dividend bit i as LSB.
+        let mut shifted = vec![pbit_new(0.0); width];
+        for j in 1..width {
+            shifted[j] = remainder.bits[j - 1];
+        }
+        shifted[0] = lhs.bits[i];
+        remainder = PInt { bits: shifted, width, signed };
+
+        // Trial subtract.
+        let (trial_rem, borrow) = pint_sub(&remainder, rhs)?;
+
+        // quotient bit: 1 when borrow == 0 (remainder >= divisor).
+        quotient_bits[i] = pbit_new(not_prob(borrow.p_one));
+
+        // Probabilistic mux: keep old remainder if borrow, else take trial.
+        let nb = not_prob(borrow.p_one);
+        let mut mux = vec![pbit_new(0.0); width];
+        for j in 0..width {
+            let keep = and_prob(borrow.p_one, remainder.bits[j].p_one);
+            let take = and_prob(nb, trial_rem.bits[j].p_one);
+            mux[j] = pbit_new(or_prob(keep, take));
+        }
+        remainder = PInt { bits: mux, width, signed };
+    }
+
+    let quotient = PInt { bits: quotient_bits, width, signed };
+    Ok((quotient, remainder))
+}
+
+/// Shift-and-add multiplication of two equal-width unsigned PInts.
+/// Each partial product is formed by AND-ing every lhs bit with the
+/// corresponding rhs bit, then shifting left by the rhs bit index.
+/// The result is truncated to the input width (lower-width bits only).
+pub fn pint_mul(lhs: &PInt, rhs: &PInt) -> Result<PInt, ArithmeticError> {
+    validate_compat(lhs, rhs)?;
+    let width = lhs.width;
+    let fmt = IntFormat { width, signed: lhs.signed };
+    let mut acc = pint_zero(&fmt).expect("zero acc");
+
+    for i in 0..width {
+        // Build the partial product: lhs AND rhs[i], shifted left by i positions.
+        let mut partial_bits = vec![pbit_new(0.0); width];
+        for j in 0..(width - i) {
+            partial_bits[i + j] = pbit_new(and_prob(lhs.bits[j].p_one, rhs.bits[i].p_one));
+        }
+        let partial = PInt { bits: partial_bits, width, signed: lhs.signed };
+        // Accumulate; discard carry (result is truncated to width).
+        let (new_acc, _) = pint_add(&acc, &partial)?;
+        acc = new_acc;
+    }
+
+    Ok(acc)
+}
+
+/// Ripple-borrow subtraction of two equal-width unsigned PInts.
+/// Returns the width-clipped difference and the final borrow-out bit.
+/// A non-zero borrow-out indicates the result underflowed (rhs > lhs).
+pub fn pint_sub(lhs: &PInt, rhs: &PInt) -> Result<(PInt, PBit), ArithmeticError> {
+    validate_compat(lhs, rhs)?;
+    let width = lhs.width;
+    let mut borrow = pbit_new(0.0);
+    let mut bits = Vec::with_capacity(width);
+
+    for i in 0..width {
+        let (diff_bit, borrow_out) = full_subtractor(lhs.bits[i], rhs.bits[i], borrow);
+        bits.push(diff_bit);
+        borrow = borrow_out;
+    }
+
+    let diff = PInt { bits, width, signed: lhs.signed };
+    Ok((diff, borrow))
+}
+
+/// Ripple-carry addition of two equal-width unsigned PInts.
+/// Returns the width-clipped sum and the final carry-out bit.
+pub fn pint_add(lhs: &PInt, rhs: &PInt) -> Result<(PInt, PBit), ArithmeticError> {
+    validate_compat(lhs, rhs)?;
+    let width = lhs.width;
+    let mut carry = pbit_new(0.0);
+    let mut bits = Vec::with_capacity(width);
+
+    for i in 0..width {
+        let (sum_bit, carry_out) = full_adder(lhs.bits[i], rhs.bits[i], carry);
+        bits.push(sum_bit);
+        carry = carry_out;
+    }
+
+    let sum = PInt { bits, width, signed: lhs.signed };
+    Ok((sum, carry))
+}
+
+pub fn clamp_prob(p: f64) -> f64 {
+    if p.is_nan() {
+        return 0.0;
+    }
+    p.clamp(0.0, 1.0)
+}
+
+pub fn and_prob(a: f64, b: f64) -> f64 {
+    clamp_prob(a * b)
+}
+
+pub fn or_prob(a: f64, b: f64) -> f64 {
+    clamp_prob(a + b - (a * b))
+}
+
+pub fn xor_prob(a: f64, b: f64) -> f64 {
+    clamp_prob((a * (1.0 - b)) + ((1.0 - a) * b))
+}
+
+pub fn not_prob(a: f64) -> f64 {
+    clamp_prob(1.0 - a)
+}
+
+pub fn full_adder(a: PBit, b: PBit, carry_in: PBit) -> (PBit, PBit) {
+    let axb = xor_prob(a.p_one, b.p_one);
+    let sum = xor_prob(axb, carry_in.p_one);
+    let carry_ab = and_prob(a.p_one, b.p_one);
+    let carry_cin = and_prob(carry_in.p_one, axb);
+    let carry_out = or_prob(carry_ab, carry_cin);
+    (pbit_new(sum), pbit_new(carry_out))
+}
+
+pub fn full_subtractor(a: PBit, b: PBit, borrow_in: PBit) -> (PBit, PBit) {
+    let axb = xor_prob(a.p_one, b.p_one);
+    let diff = xor_prob(axb, borrow_in.p_one);
+    let borrow_from_ab = and_prob(not_prob(a.p_one), b.p_one);
+    let borrow_from_bin = and_prob(borrow_in.p_one, not_prob(axb));
+    let borrow_out = or_prob(borrow_from_ab, borrow_from_bin);
+    (pbit_new(diff), pbit_new(borrow_out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx_eq(actual: f64, expected: f64) {
+        assert!((actual - expected).abs() <= EPSILON, "actual={actual}, expected={expected}");
+    }
+
+    fn assert_bounded(p: f64) {
+        assert!(p.is_finite(), "probability must be finite: {p}");
+        assert!((0.0..=1.0).contains(&p), "probability must be in [0,1]: {p}");
+    }
+
+    #[test]
+    fn and_prob_zero_zero_is_zero() {
+        approx_eq(and_prob(0.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn and_prob_one_one_is_one() {
+        approx_eq(and_prob(1.0, 1.0), 1.0);
+    }
+
+    #[test]
+    fn or_prob_zero_one_is_one() {
+        approx_eq(or_prob(0.0, 1.0), 1.0);
+    }
+
+    #[test]
+    fn or_prob_fractional_example() {
+        approx_eq(or_prob(0.2, 0.5), 0.6);
+    }
+
+    #[test]
+    fn xor_prob_zero_zero_is_zero() {
+        approx_eq(xor_prob(0.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn xor_prob_one_zero_is_one() {
+        approx_eq(xor_prob(1.0, 0.0), 1.0);
+    }
+
+    #[test]
+    fn xor_prob_half_half_is_half() {
+        approx_eq(xor_prob(0.5, 0.5), 0.5);
+    }
+
+    #[test]
+    fn not_prob_zero_is_one() {
+        approx_eq(not_prob(0.0), 1.0);
+    }
+
+    #[test]
+    fn not_prob_one_is_zero() {
+        approx_eq(not_prob(1.0), 0.0);
+    }
+
+    #[test]
+    fn clamp_prob_bounds_and_nan_behavior() {
+        approx_eq(clamp_prob(-0.2), 0.0);
+        approx_eq(clamp_prob(1.2), 1.0);
+        approx_eq(clamp_prob(f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn primitive_outputs_are_bounded_on_grid() {
+        let vals = [0.0, 1e-15, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0 - 1e-15, 1.0];
+
+        for a in vals {
+            assert_bounded(not_prob(a));
+            for b in vals {
+                assert_bounded(and_prob(a, b));
+                assert_bounded(or_prob(a, b));
+                assert_bounded(xor_prob(a, b));
+            }
+        }
+    }
+
+    #[test]
+    // Extreme numeric inputs should never leak NaN through any primitive, because
+    // NaN propagation would make higher-level arithmetic untrustworthy.
+    fn primitives_do_not_return_nan_for_extreme_inputs() {
+        let extremes = [
+            -1e308,
+            -1.0,
+            -1e-15,
+            0.0,
+            1e-15,
+            0.5,
+            1.0,
+            1.0 + 1e-15,
+            1e308,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+        ];
+
+        for a in extremes {
+            assert!(!not_prob(a).is_nan(), "not_prob returned NaN for a={a}");
+            for b in extremes {
+                assert!(!and_prob(a, b).is_nan(), "and_prob returned NaN for a={a}, b={b}");
+                assert!(!or_prob(a, b).is_nan(), "or_prob returned NaN for a={a}, b={b}");
+                assert!(!xor_prob(a, b).is_nan(), "xor_prob returned NaN for a={a}, b={b}");
+            }
+        }
+    }
+
+    #[test]
+    // Width is the primary integer-domain invariant and must be validated eagerly.
+    fn int_format_validates_width() {
+        assert_eq!(IntFormat::new(0, false), Err(ConversionError::InvalidWidth));
+        assert_eq!(IntFormat::new(8, false), Ok(IntFormat { width: 8, signed: false }));
+    }
+
+    #[test]
+    // PBit construction must guarantee bounded storage regardless of incoming data.
+    fn pbit_constructor_clamps_and_keeps_bounds() {
+        let low = pbit_new(-10.0);
+        let high = pbit_new(9.0);
+        let nan = pbit_new(f64::NAN);
+        assert_bounded(low.p_one);
+        assert_bounded(high.p_one);
+        assert_bounded(nan.p_one);
+        approx_eq(low.p_one, 0.0);
+        approx_eq(high.p_one, 1.0);
+        approx_eq(nan.p_one, 0.0);
+    }
+
+    #[test]
+    // PInt construction rejects structurally invalid representations up front,
+    // preventing later arithmetic from handling malformed inputs.
+    fn pint_new_rejects_invalid_width_or_mismatch() {
+        let bit = pbit_new(0.0);
+        assert_eq!(PInt::new(vec![bit], 0, false), Err(ConversionError::InvalidWidth));
+        assert_eq!(PInt::new(vec![bit], 2, false), Err(ConversionError::OutOfRange));
+    }
+
+    #[test]
+    // Verifies canonical constants and LSB-first ordering, which later bitwise
+    // arithmetic depends on for carry/borrow propagation direction.
+    fn pint_zero_and_one_layout_lsb_first() {
+        let fmt = IntFormat::new(8, false).expect("valid format");
+        let z = pint_zero(&fmt).expect("zero must succeed");
+        let o = pint_one(&fmt).expect("one must succeed");
+
+        for bit in &z.bits {
+            approx_eq(bit.p_one, 0.0);
+        }
+        approx_eq(o.bits[0].p_one, 1.0);
+        for bit in o.bits.iter().skip(1) {
+            approx_eq(bit.p_one, 0.0);
+        }
+    }
+
+    #[test]
+    // Round-trip conversion is the baseline correctness check for deterministic
+    // integer encodings represented as p-bits.
+    fn pint_from_u128_round_trip_for_valid_values() {
+        let fmt = IntFormat::new(16, false).expect("valid format");
+        let original = 0xA55Au128;
+        let p = pint_from_u128(original, &fmt).expect("encode");
+        let decoded = pint_to_u128(&p).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    // Ensures conversion enforces format capacity rather than silently truncating.
+    fn pint_from_u128_rejects_out_of_range_for_width() {
+        let fmt = IntFormat::new(8, false).expect("valid format");
+        assert_eq!(pint_from_u128(256, &fmt), Err(ConversionError::OutOfRange));
+    }
+
+    #[test]
+    // Current deterministic decoder must reject uncertain bits so downstream users
+    // do not mistake probabilistic states for exact integers.
+    fn pint_to_u128_rejects_non_deterministic_bits() {
+        let p = PInt::new(vec![pbit_new(0.5); 8], 8, false).expect("valid size");
+        assert_eq!(pint_to_u128(&p), Err(ConversionError::OutOfRange));
+    }
+
+    #[test]
+    // u128 conversion must fail if any significant bit exists beyond supported
+    // machine range.
+    fn pint_to_u128_rejects_set_bits_above_128_range() {
+        let fmt = IntFormat::new(129, false).expect("valid format");
+        let mut p = pint_zero(&fmt).expect("zero");
+        p.bits[128] = pbit_new(1.0);
+        assert_eq!(pint_to_u128(&p), Err(ConversionError::OutOfRange));
+    }
+
+    #[test]
+    // Arithmetic requires matching integer domains; width or signedness mismatch
+    // should fail before any operation proceeds.
+    fn validate_compat_catches_width_and_signed_mismatch() {
+        let a = PInt::new(vec![pbit_new(0.0); 8], 8, false).expect("valid");
+        let b = PInt::new(vec![pbit_new(0.0); 16], 16, false).expect("valid");
+        let c = PInt::new(vec![pbit_new(0.0); 8], 8, true).expect("valid");
+        assert_eq!(validate_compat(&a, &a), Ok(()));
+        assert_eq!(validate_compat(&a, &b), Err(ArithmeticError::WidthMismatch));
+        assert_eq!(validate_compat(&a, &c), Err(ArithmeticError::WidthMismatch));
+    }
+
+    fn as_prob(v: bool) -> f64 {
+        if v {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
+    #[test]
+    // This is the core digital-equivalence test for the probabilistic full adder:
+    // at deterministic boundaries, behavior must exactly match classical logic.
+    fn full_adder_truth_table_deterministic_inputs() {
+        for a in [false, true] {
+            for b in [false, true] {
+                for cin in [false, true] {
+                    let (sum, carry) = full_adder(
+                        pbit_new(as_prob(a)),
+                        pbit_new(as_prob(b)),
+                        pbit_new(as_prob(cin)),
+                    );
+
+                    let expected_sum = a ^ b ^ cin;
+                    let expected_carry = (a && b) || (cin && (a ^ b));
+                    approx_eq(sum.p_one, as_prob(expected_sum));
+                    approx_eq(carry.p_one, as_prob(expected_carry));
+                }
+            }
+        }
+    }
+
+    #[test]
+    // Same as above, but for subtraction. Deterministic inputs must reproduce the
+    // exact full-subtractor truth table including borrow behavior.
+    fn full_subtractor_truth_table_deterministic_inputs() {
+        for a in [false, true] {
+            for b in [false, true] {
+                for bin in [false, true] {
+                    let (diff, borrow) = full_subtractor(
+                        pbit_new(as_prob(a)),
+                        pbit_new(as_prob(b)),
+                        pbit_new(as_prob(bin)),
+                    );
+
+                    let expected_diff = a ^ b ^ bin;
+                    let expected_borrow = (!a && b) || (bin && !(a ^ b));
+                    approx_eq(diff.p_one, as_prob(expected_diff));
+                    approx_eq(borrow.p_one, as_prob(expected_borrow));
+                }
+            }
+        }
+    }
+
+    #[test]
+    // Representative-grid coverage catches compositional math errors that might not
+    // appear in deterministic truth-table testing.
+    fn full_adder_and_subtractor_outputs_stay_bounded() {
+        let vals = [0.0, 1e-15, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0 - 1e-15, 1.0];
+
+        for a in vals {
+            for b in vals {
+                for c in vals {
+                    let (sum, carry) = full_adder(pbit_new(a), pbit_new(b), pbit_new(c));
+                    let (diff, borrow) = full_subtractor(pbit_new(a), pbit_new(b), pbit_new(c));
+                    assert_bounded(sum.p_one);
+                    assert_bounded(carry.p_one);
+                    assert_bounded(diff.p_one);
+                    assert_bounded(borrow.p_one);
+                }
+            }
+        }
+    }
+
+    #[test]
+    // Symmetric uncertainty sanity-check: both operators should remain finite and
+    // bounded on maximally uncertain inputs.
+    fn full_adder_and_subtractor_half_inputs_are_finite() {
+        let (sum, carry) = full_adder(pbit_new(0.5), pbit_new(0.5), pbit_new(0.5));
+        let (diff, borrow) = full_subtractor(pbit_new(0.5), pbit_new(0.5), pbit_new(0.5));
+        assert_bounded(sum.p_one);
+        assert_bounded(carry.p_one);
+        assert_bounded(diff.p_one);
+        assert_bounded(borrow.p_one);
+    }
+
+    // ---- Phase 4.1 tests: multi-bit unsigned addition ----------------------------
+
+    fn encode(val: u128, width: usize) -> PInt {
+        let fmt = IntFormat::new(width, false).expect("valid format");
+        pint_from_u128(val, &fmt).expect("encode")
+    }
+
+    fn decode(p: &PInt) -> u128 {
+        pint_to_u128(p).expect("decode")
+    }
+
+    #[test]
+    // Basic deterministic addition with no carry: verifies the ripple-carry chain
+    // propagates correctly for a simple case.
+    fn pint_add_no_carry_simple() {
+        let a = encode(3, 8);
+        let b = encode(4, 8);
+        let (sum, carry) = pint_add(&a, &b).expect("add");
+        assert_eq!(decode(&sum), 7);
+        approx_eq(carry.p_one, 0.0);
+    }
+
+    #[test]
+    // Addition that produces a carry-out at the MSB, confirming the carry-out bit
+    // is returned separately and the sum wraps within width correctly.
+    fn pint_add_with_carry_out() {
+        let a = encode(200, 8);
+        let b = encode(100, 8);
+        let (sum, carry) = pint_add(&a, &b).expect("add");
+        // 200 + 100 = 300 = 256 + 44, so sum mod 256 = 44, carry = 1
+        assert_eq!(decode(&sum), 44);
+        approx_eq(carry.p_one, 1.0);
+    }
+
+    #[test]
+    // Adding zero should return the original value unchanged with no carry.
+    fn pint_add_identity_zero() {
+        let fmt = IntFormat::new(16, false).expect("valid format");
+        let a = encode(12345, 16);
+        let z = pint_zero(&fmt).expect("zero");
+        let (sum, carry) = pint_add(&a, &z).expect("add");
+        assert_eq!(decode(&sum), 12345);
+        approx_eq(carry.p_one, 0.0);
+    }
+
+    #[test]
+    // Max-value addition (all ones + 1) should wrap to zero with carry-out set,
+    // exercising every bit in the ripple chain.
+    fn pint_add_max_plus_one_wraps_to_zero() {
+        let a = encode(255, 8);
+        let b = encode(1, 8);
+        let (sum, carry) = pint_add(&a, &b).expect("add");
+        assert_eq!(decode(&sum), 0);
+        approx_eq(carry.p_one, 1.0);
+    }
+
+    #[test]
+    // Commutativity check: a + b must equal b + a for deterministic inputs.
+    fn pint_add_commutativity() {
+        let a = encode(57, 8);
+        let b = encode(83, 8);
+        let (sum_ab, carry_ab) = pint_add(&a, &b).expect("add ab");
+        let (sum_ba, carry_ba) = pint_add(&b, &a).expect("add ba");
+        assert_eq!(decode(&sum_ab), decode(&sum_ba));
+        approx_eq(carry_ab.p_one, carry_ba.p_one);
+    }
+
+    #[test]
+    // Width mismatch must be rejected immediately before any bits are processed.
+    fn pint_add_rejects_width_mismatch() {
+        let a = encode(1, 8);
+        let b = encode(1, 16);
+        assert_eq!(pint_add(&a, &b), Err(ArithmeticError::WidthMismatch));
+    }
+
+    #[test]
+    // Wider width (32-bit) round-trip confirms the ripple-carry implementation
+    // scales correctly beyond a single byte.
+    fn pint_add_32bit_round_trip() {
+        let a = encode(1_000_000, 32);
+        let b = encode(2_000_000, 32);
+        let (sum, carry) = pint_add(&a, &b).expect("add");
+        assert_eq!(decode(&sum), 3_000_000);
+        approx_eq(carry.p_one, 0.0);
+    }
+
+    // ---- Phase 4.2 tests: multi-bit unsigned subtraction -------------------------
+
+    #[test]
+    // Basic deterministic subtraction with no borrow: confirms the ripple-borrow
+    // chain propagates correctly for a simple case.
+    fn pint_sub_no_borrow_simple() {
+        let a = encode(9, 8);
+        let b = encode(4, 8);
+        let (diff, borrow) = pint_sub(&a, &b).expect("sub");
+        assert_eq!(decode(&diff), 5);
+        approx_eq(borrow.p_one, 0.0);
+    }
+
+    #[test]
+    // Equal values must produce zero with no borrow.
+    fn pint_sub_equal_values_is_zero() {
+        let a = encode(42, 8);
+        let b = encode(42, 8);
+        let (diff, borrow) = pint_sub(&a, &b).expect("sub");
+        assert_eq!(decode(&diff), 0);
+        approx_eq(borrow.p_one, 0.0);
+    }
+
+    #[test]
+    // Subtracting a larger value from a smaller one must wrap (modular) and set
+    // borrow-out, indicating unsigned underflow to the caller.
+    fn pint_sub_underflow_sets_borrow() {
+        let a = encode(3, 8);
+        let b = encode(5, 8);
+        let (diff, borrow) = pint_sub(&a, &b).expect("sub");
+        // 3 - 5 wraps to 254 in 8-bit unsigned arithmetic
+        assert_eq!(decode(&diff), 254);
+        approx_eq(borrow.p_one, 1.0);
+    }
+
+    #[test]
+    // Subtracting zero must leave the value unchanged with no borrow.
+    fn pint_sub_identity_zero() {
+        let fmt = IntFormat::new(16, false).expect("valid format");
+        let a = encode(9999, 16);
+        let z = pint_zero(&fmt).expect("zero");
+        let (diff, borrow) = pint_sub(&a, &z).expect("sub");
+        assert_eq!(decode(&diff), 9999);
+        approx_eq(borrow.p_one, 0.0);
+    }
+
+    #[test]
+    // 0 - 1 should wrap to max value with borrow set, exercising the full
+    // borrow ripple from LSB to MSB.
+    fn pint_sub_zero_minus_one_wraps_to_max() {
+        let a = encode(0, 8);
+        let b = encode(1, 8);
+        let (diff, borrow) = pint_sub(&a, &b).expect("sub");
+        assert_eq!(decode(&diff), 255);
+        approx_eq(borrow.p_one, 1.0);
+    }
+
+    #[test]
+    // add followed by sub must round-trip for values within range,
+    // confirming the two operations are consistent inverses.
+    fn pint_add_then_sub_round_trip() {
+        let a = encode(77, 8);
+        let b = encode(33, 8);
+        let (sum, _) = pint_add(&a, &b).expect("add");
+        let (result, borrow) = pint_sub(&sum, &b).expect("sub");
+        assert_eq!(decode(&result), 77);
+        approx_eq(borrow.p_one, 0.0);
+    }
+
+    #[test]
+    // Width mismatch must be rejected before any bits are processed.
+    fn pint_sub_rejects_width_mismatch() {
+        let a = encode(1, 8);
+        let b = encode(1, 16);
+        assert_eq!(pint_sub(&a, &b), Err(ArithmeticError::WidthMismatch));
+    }
+
+    // ---- Phase 4.3 tests: multi-bit unsigned multiplication ----------------------
+
+    #[test]
+    // Fundamental correctness check: deterministic small values whose product
+    // fits within the width.
+    fn pint_mul_basic() {
+        let a = encode(6, 8);
+        let b = encode(7, 8);
+        let result = pint_mul(&a, &b).expect("mul");
+        assert_eq!(decode(&result), 42);
+    }
+
+    #[test]
+    // Multiplying by zero must return zero regardless of the other operand.
+    fn pint_mul_by_zero_is_zero() {
+        let fmt = IntFormat::new(8, false).expect("valid format");
+        let a = encode(123, 8);
+        let z = pint_zero(&fmt).expect("zero");
+        let result = pint_mul(&a, &z).expect("mul");
+        assert_eq!(decode(&result), 0);
+    }
+
+    #[test]
+    // Multiplying by one must return the original value unchanged.
+    fn pint_mul_by_one_is_identity() {
+        let a = encode(87, 8);
+        let one = encode(1, 8);
+        let result = pint_mul(&a, &one).expect("mul");
+        assert_eq!(decode(&result), 87);
+    }
+
+    #[test]
+    // Commutativity: a * b must equal b * a for deterministic inputs.
+    fn pint_mul_commutativity() {
+        let a = encode(11, 8);
+        let b = encode(13, 8);
+        let ab = pint_mul(&a, &b).expect("mul ab");
+        let ba = pint_mul(&b, &a).expect("mul ba");
+        assert_eq!(decode(&ab), decode(&ba));
+    }
+
+    #[test]
+    // Overflow wraps to lower width bits, confirming truncation behavior matches
+    // unsigned modular arithmetic semantics.
+    fn pint_mul_overflow_truncates() {
+        // 16 * 16 = 256 which overflows 8 bits, wraps to 0
+        let a = encode(16, 8);
+        let b = encode(16, 8);
+        let result = pint_mul(&a, &b).expect("mul");
+        assert_eq!(decode(&result), 0);
+    }
+
+    #[test]
+    // Wider width correctness check to confirm the shift-and-add logic scales
+    // beyond a single byte.
+    fn pint_mul_16bit() {
+        let a = encode(300, 16);
+        let b = encode(200, 16);
+        let result = pint_mul(&a, &b).expect("mul");
+        // 300 * 200 = 60000, which fits in 16 bits (max 65535)
+        assert_eq!(decode(&result), 60000);
+    }
+
+    #[test]
+    // Width mismatch must be rejected before any computation.
+    fn pint_mul_rejects_width_mismatch() {
+        let a = encode(1, 8);
+        let b = encode(1, 16);
+        assert_eq!(pint_mul(&a, &b), Err(ArithmeticError::WidthMismatch));
+    }
+
+    // ---- Phase 4.4 tests: multi-bit unsigned division ----------------------------
+
+    #[test]
+    // Basic exact division with no remainder.
+    fn pint_div_exact() {
+        let a = encode(42, 8);
+        let b = encode(6, 8);
+        let (q, r) = pint_div(&a, &b).expect("div");
+        assert_eq!(decode(&q), 7);
+        assert_eq!(decode(&r), 0);
+    }
+
+    #[test]
+    // Division with a non-zero remainder confirms remainder semantics are correct.
+    fn pint_div_with_remainder() {
+        let a = encode(17, 8);
+        let b = encode(5, 8);
+        let (q, r) = pint_div(&a, &b).expect("div");
+        assert_eq!(decode(&q), 3);
+        assert_eq!(decode(&r), 2);
+    }
+
+    #[test]
+    // Dividing by 1 must return the original value with remainder 0.
+    fn pint_div_by_one_is_identity() {
+        let a = encode(123, 8);
+        let one = encode(1, 8);
+        let (q, r) = pint_div(&a, &one).expect("div");
+        assert_eq!(decode(&q), 123);
+        assert_eq!(decode(&r), 0);
+    }
+
+    #[test]
+    // Dividing a value by itself must return 1 with remainder 0.
+    fn pint_div_self_is_one() {
+        let a = encode(77, 8);
+        let b = encode(77, 8);
+        let (q, r) = pint_div(&a, &b).expect("div");
+        assert_eq!(decode(&q), 1);
+        assert_eq!(decode(&r), 0);
+    }
+
+    #[test]
+    // Dividing a smaller value by a larger one must give quotient 0 and
+    // remainder equal to the dividend.
+    fn pint_div_smaller_by_larger() {
+        let a = encode(3, 8);
+        let b = encode(10, 8);
+        let (q, r) = pint_div(&a, &b).expect("div");
+        assert_eq!(decode(&q), 0);
+        assert_eq!(decode(&r), 3);
+    }
+
+    #[test]
+    // Zero divided by any non-zero value is zero with remainder zero.
+    fn pint_div_zero_dividend() {
+        let fmt = IntFormat::new(8, false).expect("valid format");
+        let z = pint_zero(&fmt).expect("zero");
+        let b = encode(7, 8);
+        let (q, r) = pint_div(&z, &b).expect("div");
+        assert_eq!(decode(&q), 0);
+        assert_eq!(decode(&r), 0);
+    }
+
+    #[test]
+    // Division by zero must return DivisionByZero before any arithmetic occurs.
+    fn pint_div_by_zero_returns_error() {
+        let fmt = IntFormat::new(8, false).expect("valid format");
+        let a = encode(10, 8);
+        let z = pint_zero(&fmt).expect("zero");
+        assert_eq!(pint_div(&a, &z), Err(ArithmeticError::DivisionByZero));
+    }
+
+    #[test]
+    // Width mismatch must be rejected before any computation.
+    fn pint_div_rejects_width_mismatch() {
+        let a = encode(1, 8);
+        let b = encode(1, 16);
+        assert_eq!(pint_div(&a, &b), Err(ArithmeticError::WidthMismatch));
+    }
+
+    #[test]
+    // Deterministic check with printed output for quick visual inspection.
+    fn pint_div_3937_by_31_prints_results() {
+        let a = encode(3937, 16);
+        let b = encode(31, 16);
+        let (q, r) = pint_div(&a, &b).expect("div");
+
+        let q_u = decode(&q);
+        let r_u = decode(&r);
+
+        println!("dividend=3937 divisor=31 quotient={q_u} remainder={r_u}");
+
+        assert_eq!(q_u, 127);
+        assert_eq!(r_u, 0);
+    }
+
+    #[test]
+    // Divides 899 by a probabilistic unsigned value whose lower 8 bits are 0.50.
+    // We validate successful execution and invariant preservation rather than a
+    // deterministic integer quotient/remainder.
+    fn pint_div_by_probabilistic_lower_8_half_bits() {
+        let width = 16;
+        let dividend = encode(899, width);
+
+        let mut divisor_bits = vec![pbit_new(0.0); width];
+        for bit in divisor_bits.iter_mut().take(8) {
+            *bit = pbit_new(0.5);
+        }
+        let divisor = PInt::new(divisor_bits, width, false).expect("valid probabilistic divisor");
+
+        let (q, r) = pint_div(&dividend, &divisor).expect("division should succeed");
+
+        let divisor_arr: Vec<f64> = divisor.bits.iter().map(|b| b.p_one).collect();
+        let q_arr: Vec<f64> = q.bits.iter().map(|b| b.p_one).collect();
+        let r_arr: Vec<f64> = r.bits.iter().map(|b| b.p_one).collect();
+
+        println!("dividend_u128=899");
+        println!("divisor_bits={:?}", divisor_arr);
+        println!("q_bits={:?}", q_arr);
+        println!("r_bits={:?}", r_arr);
+
+        assert_eq!(q.width, width);
+        assert_eq!(r.width, width);
+        assert!(!q.signed);
+        assert!(!r.signed);
+
+        for bit in &q.bits {
+            assert_bounded(bit.p_one);
+        }
+        for bit in &r.bits {
+            assert_bounded(bit.p_one);
+        }
+    }
+
+    #[test]
+    // Reconstruct dividend from quotient and remainder: q*b + r == a.
+    fn pint_div_quotient_remainder_reconstruct() {
+        let a = encode(100, 16);
+        let b = encode(7, 16);
+        let (q, r) = pint_div(&a, &b).expect("div");
+        let (prod, _) = pint_add(&pint_mul(&q, &b).expect("mul"), &r).expect("add");
+        assert_eq!(decode(&prod), 100);
+    }
+}
